@@ -156,122 +156,78 @@ Review it against the REST standards and return violations as a JSON array.
             if raw.startswith("json"):
                 raw = raw[4:]
         violations = json.loads(raw)
-        return violations if isinstance(violations, list) else []
+        if not isinstance(violations, list):
+            return []
+        # Filter out any non-dict items GPT may have accidentally included
+        return [v for v in violations if isinstance(v, dict)]
     except Exception as e:
         print(f"  ⚠ LLM call failed for {filepath}: {e}")
         return []
 
 
-def get_line_for_path(patch: str, oas_path: str, method: str) -> int | None:
+def post_pr_comment(violations_by_file: dict):
     """
-    Try to find the diff line number for a given OAS path+method.
-    Falls back to None (will post a file-level comment instead).
+    Post a single PR issue comment summarising all violations.
+    Uses the simple issue comments API — no commit SHA or line numbers needed.
     """
-    if not patch:
-        return None
-    search_terms = [oas_path, method.lower() + ":"]
-    lines = patch.split("\n")
-    line_num = None
-    current_line = 0
-    for line in lines:
-        if line.startswith("@@"):
-            # Extract starting line number from @@ -a,b +c,d @@
-            try:
-                parts = line.split("+")[1].split(",")[0]
-                current_line = int(parts) - 1
-            except Exception:
-                current_line = 0
-        elif not line.startswith("-"):
-            current_line += 1
-            for term in search_terms:
-                if term in line:
-                    line_num = current_line
-    return line_num
-
-
-def get_pr_latest_commit():
-    url = f"{GH_API}/repos/{REPO}/pulls/{PR_NUMBER}"
-    resp = requests.get(url, headers=GH_HEADERS)
-    resp.raise_for_status()
-    return resp.json()["head"]["sha"]
-
-
-def post_pr_review(violations_by_file: dict, commit_sha: str):
-    """
-    Post a single PR review with all inline comments + a summary body.
-    """
-    comments = []
     summary_lines = ["## 🤖 OAS REST Standards Review\n"]
 
     total_errors = 0
     total_warnings = 0
 
     for filepath, violations in violations_by_file.items():
-        if not violations:
-            summary_lines.append(f"✅ `{filepath}` — No violations found.")
+        if filepath.startswith("__patch__"):
             continue
 
-        errors = [v for v in violations if v.get("severity") == "error"]
+        if not violations:
+            summary_lines.append(f"\n✅ **`{filepath}`** — No violations found.")
+            continue
+
+        errors   = [v for v in violations if v.get("severity") == "error"]
         warnings = [v for v in violations if v.get("severity") == "warning"]
-        total_errors += len(errors)
+        total_errors   += len(errors)
         total_warnings += len(warnings)
 
         icon = "❌" if errors else "⚠️"
-        summary_lines.append(
-            f"\n{icon} `{filepath}` — {len(errors)} error(s), {len(warnings)} warning(s)"
-        )
+        summary_lines.append(f"\n{icon} **`{filepath}`** — {len(errors)} error(s), {len(warnings)} warning(s)\n")
 
-        patch = violations_by_file.get(f"__patch__{filepath}", "")
-
+        # Group by path for readability
+        by_path = {}
         for v in violations:
-            severity_icon = "🔴" if v.get("severity") == "error" else "🟡"
-            body = (
-                f"{severity_icon} **[{v.get('severity', 'issue').upper()}] {v.get('rule', 'REST Violation')}**\n\n"
-                f"{v.get('message', '')}\n\n"
-                f"_Affected: `{v.get('path', 'N/A')}` · `{v.get('method', 'general').upper()}`_"
-            )
+            by_path.setdefault(v.get("path", "general"), []).append(v)
 
-            line = get_line_for_path(patch, v.get("path", ""), v.get("method", ""))
-
-            if line:
-                comments.append({
-                    "path": filepath,
-                    "line": line,
-                    "side": "RIGHT",
-                    "body": body,
-                })
-            else:
-                # Fallback: add to summary if we can't pin to a line
-                summary_lines.append(f"\n> {body}")
+        for oas_path, path_violations in by_path.items():
+            summary_lines.append(f"<details><summary><code>{oas_path}</code></summary>\n")
+            for v in path_violations:
+                sev_icon = "🔴" if v.get("severity") == "error" else "🟡"
+                summary_lines.append(
+                    f"\n{sev_icon} **[{v.get('severity','issue').upper()}]** `{v.get('method','general').upper()}` — "
+                    f"**{v.get('rule', 'REST Violation')}**\n"
+                    f"> {v.get('message', '')}\n"
+                )
+            summary_lines.append("</details>\n")
 
     # Overall verdict
     if total_errors == 0 and total_warnings == 0:
         verdict = "✅ **All checks passed!** No REST standard violations found."
-        event = "APPROVE"
     elif total_errors == 0:
-        verdict = f"⚠️ **{total_warnings} warning(s) found.** Please review."
-        event = "COMMENT"
+        verdict = f"⚠️ **{total_warnings} warning(s) found.** Please review before merging."
     else:
         verdict = f"❌ **{total_errors} error(s) and {total_warnings} warning(s) found.** Please fix before merging."
-        event = "REQUEST_CHANGES"
 
     summary_lines.insert(1, f"\n{verdict}\n")
     summary_lines.append("\n---\n_Reviewed by OAS REST Standards Bot powered by GPT-4o_")
 
-    payload = {
-        "commit_id": commit_sha,
-        "body": "\n".join(summary_lines),
-        "event": event,
-        "comments": comments,
-    }
+    body = "\n".join(summary_lines)
 
-    url = f"{GH_API}/repos/{REPO}/pulls/{PR_NUMBER}/reviews"
-    resp = requests.post(url, headers=GH_HEADERS, json=payload)
+    url = f"{GH_API}/repos/{REPO}/issues/{PR_NUMBER}/comments"
+    resp = requests.post(url, headers=GH_HEADERS, json={"body": body})
 
     if resp.status_code in (200, 201):
-        print(f"✅ Review posted: {event} ({total_errors} errors, {total_warnings} warnings)")
+        print(f"✅ Comment posted ({total_errors} errors, {total_warnings} warnings)")
     else:
-        print(f"⚠ Failed to post review: {resp.status_code} {resp.text}")
+        print(f"⚠ Failed to post comment: {resp.status_code} {resp.text}")
+        sys.exit(1)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -284,7 +240,6 @@ def main():
         print("No OAS files changed. Skipping review.")
         sys.exit(0)
 
-    commit_sha = get_pr_latest_commit()
     violations_by_file = {}
 
     for file_info in changed_files:
@@ -316,8 +271,8 @@ def main():
         print("\nNo OAS specs found in the changed files.")
         sys.exit(0)
 
-    print("\n💬 Posting review to GitHub PR...")
-    post_pr_review(violations_by_file, commit_sha)
+    print("\n💬 Posting comment to GitHub PR...")
+    post_pr_comment(violations_by_file)
 
 
 if __name__ == "__main__":
