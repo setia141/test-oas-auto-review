@@ -22,7 +22,7 @@ paths:
     post:
       tags:
         - pet
-      summary: Add a new pet to the store
+      summary: Add a new pet to the store, or you can delete, your wish
       description: ''
       operationId: addPet
       responses:
